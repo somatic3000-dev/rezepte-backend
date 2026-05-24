@@ -1,0 +1,6 @@
+{
+  "name": "rezepte-backend",
+  "version": "1.0.0",
+  "description": "Vercel Backend für RecipeFinder – extrahiert Rezeptdaten aus URLs",
+  "private": true
+}
