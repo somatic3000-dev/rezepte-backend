@@ -6,7 +6,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ► Hier deine Vercel-URL eintragen (nach dem Deployment):
-const BACKEND_URL = "https://DEINE-URL.vercel.app";
+const BACKEND_URL = "https://rezepte-backend.vercel.app";
 
 // Überschreibt simulateUrlRecipeImport aus script.js
 async function simulateUrlRecipeImport(event) {
