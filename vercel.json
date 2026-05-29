@@ -2,7 +2,7 @@
   "version": 2,
   "crons": [
     {
-      "path": "/api/cron",
+      "path": "/api/scan",
       "schedule": "0 7 * * 1"
     }
   ]
