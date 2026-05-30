@@ -1,5 +1,4 @@
-// api/scan.js – Scannt Rezeptseiten nach neuen Rezepten via Sitemap oder RSS
-// Wird vom Cron-Job und manuell aufgerufen
+// api/scan.js – Intelligenter Scanner: Sitemap/Scraping wo möglich, RSS als Fallback
 
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -9,20 +8,21 @@ const BASE_URL = process.env.VERCEL_URL
 
 const MAX_PER_SITE = 10;
 
-// Bekannte Sitemap/RSS-Pfade je Domain
-const SITE_HINTS = {
-  "chefkoch.de":          { sitemap: "/sitemap-rezepte.xml", rss: "/magazin/rss.xml" },
-  "lecker.de":            { sitemap: "/sitemap-rezepte.xml", rss: "/rss.xml" },
-  "essen-und-trinken.de": { sitemap: "/sitemap.xml",         rss: "/rss.xml" },
-  "kuechengoetter.de":    { sitemap: "/sitemap.xml",         rss: "/feed" },
-  "eatsmarter.de":        { sitemap: "/sitemap.xml",         rss: "/rss.xml" },
-  "springlane.de":        { sitemap: "/sitemap.xml",         rss: "/magazin/feed" },
-  "zuckerjagdwurst.com":  { sitemap: "/sitemap.xml",         rss: "/feed" },
-  "biancazapatka.com":    { sitemap: "/sitemap.xml",         rss: "/feed" },
-  "gaumenfreundin.de":    { sitemap: "/sitemap.xml",         rss: "/feed" },
-  "emmikochteinfach.de":  { sitemap: "/sitemap.xml",         rss: "/feed" },
-  "rewe.de":              { sitemap: "/sitemap.xml",         rss: null },
-  "edeka.de":             { sitemap: "/sitemap.xml",         rss: null },
+// Bekannte Konfigurationen je Domain
+// method: "sitemap" | "rss" | "both"
+const SITE_CONFIG = {
+  "chefkoch.de":          { method: "rss",     rss: "/magazin/rss.xml" },
+  "lecker.de":            { method: "rss",     rss: "/rss.xml" },
+  "essen-und-trinken.de": { method: "rss",     rss: "/rss.xml" },
+  "rewe.de":              { method: "sitemap", sitemap: "/sitemap.xml", recipePattern: "/rezepte/" },
+  "edeka.de":             { method: "sitemap", sitemap: "/sitemap.xml", recipePattern: "/rezepte/" },
+  "eatsmarter.de":        { method: "both",    sitemap: "/sitemap.xml", rss: "/rss.xml", recipePattern: "/rezepte/" },
+  "kuechengoetter.de":    { method: "both",    sitemap: "/sitemap.xml", rss: "/feed",    recipePattern: "/rezepte/" },
+  "springlane.de":        { method: "both",    sitemap: "/sitemap.xml", rss: "/magazin/feed", recipePattern: "/magazin/" },
+  "zuckerjagdwurst.com":  { method: "rss",     rss: "/feed" },
+  "biancazapatka.com":    { method: "rss",     rss: "/de/feed" },
+  "gaumenfreundin.de":    { method: "rss",     rss: "/feed" },
+  "emmikochteinfach.de":  { method: "rss",     rss: "/feed" },
 };
 
 async function redis(command, ...args) {
@@ -45,133 +45,57 @@ async function redisPost(body) {
 }
 
 async function fetchText(url) {
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; RecipeFinderBot/1.0)",
-      Accept: "text/html,application/xhtml+xml,application/xml,text/xml,*/*"
-    },
-    signal: AbortSignal.timeout(12000),
-    redirect: "follow"
-  });
-  if (!response.ok) return null;
-  return response.text();
-}
-
-// Rezept-URLs aus Sitemap extrahieren
-function extractUrlsFromSitemap(xml, baseHost) {
-  const urls = [];
-  const locMatches = xml.matchAll(/<loc>(.*?)<\/loc>/gs);
-  for (const match of locMatches) {
-    const url = match[1].trim();
-    // Nur echte Rezept-URLs (enthalten typische Schlüsselwörter)
-    if (isLikelyRecipeUrl(url, baseHost)) {
-      urls.push(url);
-    }
+  try {
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; RecipeFinderBot/1.0)",
+        Accept: "application/rss+xml, application/xml, text/xml, text/html, */*"
+      },
+      signal: AbortSignal.timeout(12000),
+      redirect: "follow"
+    });
+    if (!response.ok) return null;
+    return response.text();
+  } catch {
+    return null;
   }
-  return urls;
 }
 
-// Rezept-URLs aus RSS extrahieren
+// ── RSS ──────────────────────────────────────────────────────────────────────
+
 function extractUrlsFromRSS(xml) {
   const urls = [];
-  const linkMatches = xml.matchAll(/<link>(.*?)<\/link>/gs);
+
+  const linkMatches = [...xml.matchAll(/<link>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?<\/link>/gs)];
   for (const match of linkMatches) {
     const url = match[1].trim();
     if (url.startsWith("http")) urls.push(url);
   }
-  // Auch <guid> Tags prüfen
-  const guidMatches = xml.matchAll(/<guid[^>]*>(.*?)<\/guid>/gs);
+
+  const guidMatches = [...xml.matchAll(/<guid[^>]*>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?<\/guid>/gs)];
   for (const match of guidMatches) {
     const url = match[1].trim();
     if (url.startsWith("http") && !urls.includes(url)) urls.push(url);
   }
+
+  const atomMatches = [...xml.matchAll(/<link[^>]+href="([^"]+)"/g)];
+  for (const match of atomMatches) {
+    const url = match[1].trim();
+    if (url.startsWith("http") && !urls.includes(url)) urls.push(url);
+  }
+
   return urls;
 }
 
-// Prüft ob eine URL wahrscheinlich ein einzelnes Rezept ist
-function isLikelyRecipeUrl(url, baseHost) {
-  try {
-    const parsed = new URL(url);
-    if (!parsed.hostname.includes(baseHost)) return false;
+async function getUrlsFromRSS(baseUrl, rssPaths) {
+  const candidates = Array.isArray(rssPaths) ? rssPaths : [rssPaths];
+  const fallbacks = ["/feed", "/rss.xml", "/feed.xml", "/atom.xml"];
+  const all = [...new Set([...candidates, ...fallbacks])];
 
-    const path = parsed.pathname.toLowerCase();
-
-    // Ausschließen: Kategorieseiten, Tag-Seiten, Autorenseiten etc.
-    const excluded = ["/tag/", "/kategorie/", "/category/", "/autor/", "/author/",
-      "/page/", "/search", "/suche", "/magazin/", "/blog/", "/tipps/",
-      "/sitemap", "/feed", "/rss", "/?", "/impressum", "/datenschutz"];
-    if (excluded.some(e => path.includes(e))) return false;
-
-    // Einschließen: Pfade die auf Rezepte hinweisen
-    const included = ["/rezept", "/recipe", "/kochen", "/backen", "/gericht"];
-    if (included.some(e => path.includes(e))) return true;
-
-    // Pfade mit ausreichend Tiefe (z.B. /pasta/carbonara-123)
-    const segments = path.split("/").filter(Boolean);
-    if (segments.length >= 2) return true;
-
-    return false;
-  } catch {
-    return false;
-  }
-}
-
-// Versucht Sitemap-Index → einzelne Sitemaps zu finden
-async function findRecipeUrlsFromSitemap(baseUrl, hostname) {
-  const hints = SITE_HINTS[hostname] || {};
-  const candidates = [
-    hints.sitemap,
-    "/sitemap.xml",
-    "/sitemap_index.xml",
-    "/rezepte-sitemap.xml",
-    "/recipe-sitemap.xml"
-  ].filter(Boolean);
-
-  for (const path of candidates) {
+  for (const path of all) {
     const xml = await fetchText(baseUrl + path);
     if (!xml) continue;
-
-    // Sitemap-Index? → Unter-Sitemaps laden
-    if (xml.includes("<sitemapindex") || xml.includes("<sitemap>")) {
-      const subMatches = [...xml.matchAll(/<loc>(.*?)<\/loc>/gs)];
-      for (const match of subMatches) {
-        const subUrl = match[1].trim();
-        if (subUrl.toLowerCase().includes("rezept") || subUrl.toLowerCase().includes("recipe")) {
-          const subXml = await fetchText(subUrl);
-          if (subXml) {
-            const urls = extractUrlsFromSitemap(subXml, hostname);
-            if (urls.length > 0) return urls;
-          }
-        }
-      }
-    }
-
-    // Direkte Sitemap
-    const urls = extractUrlsFromSitemap(xml, hostname);
-    if (urls.length > 0) return urls;
-  }
-
-  return [];
-}
-
-// Versucht RSS-Feed zu finden
-async function findRecipeUrlsFromRSS(baseUrl, hostname) {
-  const hints = SITE_HINTS[hostname] || {};
-  if (hints.rss === null) return [];
-
-  const candidates = [
-    hints.rss,
-    "/feed",
-    "/rss.xml",
-    "/feed.xml",
-    "/atom.xml",
-    "/rezepte/feed"
-  ].filter(Boolean);
-
-  for (const path of candidates) {
-    const xml = await fetchText(baseUrl + path);
-    if (!xml) continue;
-    if (!xml.includes("<rss") && !xml.includes("<feed") && !xml.includes("<item>")) continue;
+    if (!xml.includes("<rss") && !xml.includes("<feed") && !xml.includes("<item>") && !xml.includes("<entry>")) continue;
     const urls = extractUrlsFromRSS(xml);
     if (urls.length > 0) return urls;
   }
@@ -179,35 +103,98 @@ async function findRecipeUrlsFromRSS(baseUrl, hostname) {
   return [];
 }
 
-// Hauptfunktion: Scannt eine Domain und gibt neue Rezept-URLs zurück
-async function scanSiteForNewRecipes(siteUrl) {
+// ── Sitemap ───────────────────────────────────────────────────────────────────
+
+function extractUrlsFromSitemap(xml, recipePattern) {
+  const urls = [];
+  const locMatches = [...xml.matchAll(/<loc>(.*?)<\/loc>/gs)];
+
+  for (const match of locMatches) {
+    const url = match[1].trim();
+    if (recipePattern && url.includes(recipePattern)) {
+      urls.push(url);
+    } else if (!recipePattern && isLikelyRecipeUrl(url)) {
+      urls.push(url);
+    }
+  }
+
+  return urls;
+}
+
+function isLikelyRecipeUrl(url) {
+  try {
+    const path = new URL(url).pathname.toLowerCase();
+    const excluded = ["/tag/", "/kategorie/", "/category/", "/autor/", "/author/",
+      "/page/", "/search", "/suche", "/sitemap", "/feed", "/rss", "/impressum", "/datenschutz"];
+    if (excluded.some(e => path.includes(e))) return false;
+    const included = ["/rezept", "/recipe"];
+    if (included.some(e => path.includes(e))) return true;
+    return path.split("/").filter(Boolean).length >= 2;
+  } catch {
+    return false;
+  }
+}
+
+async function getUrlsFromSitemap(baseUrl, sitemapPath, recipePattern) {
+  const candidates = [sitemapPath, "/sitemap.xml", "/sitemap_index.xml"].filter(Boolean);
+
+  for (const path of candidates) {
+    const xml = await fetchText(baseUrl + path);
+    if (!xml) continue;
+
+    // Sitemap-Index → Unter-Sitemaps durchsuchen
+    if (xml.includes("<sitemapindex") || (xml.includes("<sitemap>") && xml.includes("<loc>"))) {
+      const subMatches = [...xml.matchAll(/<loc>(.*?)<\/loc>/gs)];
+      for (const match of subMatches) {
+        const subUrl = match[1].trim();
+        const subPath = subUrl.toLowerCase();
+        if (subPath.includes("rezept") || subPath.includes("recipe") || subPath.includes("food")) {
+          const subXml = await fetchText(subUrl);
+          if (subXml) {
+            const urls = extractUrlsFromSitemap(subXml, recipePattern);
+            if (urls.length > 0) return urls;
+          }
+        }
+      }
+    }
+
+    const urls = extractUrlsFromSitemap(xml, recipePattern);
+    if (urls.length > 0) return urls;
+  }
+
+  return [];
+}
+
+// ── Hauptlogik ────────────────────────────────────────────────────────────────
+
+async function findNewRecipeUrls(siteUrl) {
   const parsed = new URL(siteUrl);
   const baseUrl = parsed.origin;
   const hostname = parsed.hostname.replace(/^www\./, "");
+  const config = SITE_CONFIG[hostname] || { method: "both" };
 
   let candidateUrls = [];
 
-  // 1. Sitemap versuchen
-  candidateUrls = await findRecipeUrlsFromSitemap(baseUrl, hostname);
-
-  // 2. RSS als Fallback
-  if (candidateUrls.length === 0) {
-    candidateUrls = await findRecipeUrlsFromRSS(baseUrl, hostname);
+  if (config.method === "rss" || config.method === "both") {
+    candidateUrls = await getUrlsFromRSS(baseUrl, config.rss);
   }
 
-  if (candidateUrls.length === 0) return [];
+  if ((config.method === "sitemap" || config.method === "both") && candidateUrls.length === 0) {
+    candidateUrls = await getUrlsFromSitemap(baseUrl, config.sitemap, config.recipePattern);
+  }
 
-  // Bereits importierte URLs filtern
+  // Bereits importierte herausfiltern
   const newUrls = [];
   for (const url of candidateUrls) {
-    const urlKey = `recipe_url:${encodeURIComponent(url)}`;
-    const existing = await redis("get", urlKey);
+    const existing = await redis("get", `recipe_url:${encodeURIComponent(url)}`);
     if (!existing) newUrls.push(url);
     if (newUrls.length >= MAX_PER_SITE) break;
   }
 
   return newUrls;
 }
+
+// ── Handler ───────────────────────────────────────────────────────────────────
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -216,7 +203,6 @@ export default async function handler(req, res) {
 
   if (req.method === "OPTIONS") return res.status(200).end();
 
-  // Sicherheit
   const authHeader = req.headers.authorization;
   if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
     return res.status(401).json({ error: "Nicht autorisiert" });
@@ -227,7 +213,6 @@ export default async function handler(req, res) {
   let totalSkipped = 0;
 
   try {
-    // Alle gespeicherten Seiten laden
     const raw = await redis("get", "import_urls");
     const sites = raw ? JSON.parse(raw) : [];
     const activeSites = sites.filter(s => s.active);
@@ -238,12 +223,11 @@ export default async function handler(req, res) {
       log.push(`\nScanne: ${site.url}`);
 
       try {
-        const newUrls = await scanSiteForNewRecipes(site.url);
-        log.push(`  → ${newUrls.length} neue Rezept-URLs gefunden`);
+        const newUrls = await findNewRecipeUrls(site.url);
+        log.push(`  → ${newUrls.length} neue URLs gefunden`);
 
         for (const recipeUrl of newUrls) {
           try {
-            // Rezept scrapen
             const scrapeRes = await fetch(
               `${BASE_URL}/api/scrape?url=${encodeURIComponent(recipeUrl)}`,
               { signal: AbortSignal.timeout(15000) }
@@ -251,9 +235,12 @@ export default async function handler(req, res) {
             if (!scrapeRes.ok) { totalSkipped++; continue; }
 
             const data = await scrapeRes.json();
-            if (!data.success) { totalSkipped++; continue; }
+            if (!data.success || !data.ingredients || data.ingredients.length === 0) {
+              log.push(`  ✗ Kein Rezept: ${recipeUrl}`);
+              totalSkipped++;
+              continue;
+            }
 
-            // Rezept speichern
             const recipe = {
               id: `auto-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
               title: data.name || "Importiertes Rezept",
@@ -279,43 +266,30 @@ export default async function handler(req, res) {
               body: JSON.stringify(recipe)
             });
 
-            // URL als importiert markieren
             await redisPost(["set", `recipe_url:${encodeURIComponent(recipeUrl)}`, recipe.id]);
 
             log.push(`  ✓ Importiert: „${recipe.title}"`);
             totalImported++;
 
-            // Kurze Pause zwischen Requests
             await new Promise(r => setTimeout(r, 800));
 
           } catch (err) {
-            log.push(`  ✗ Fehler bei ${recipeUrl}: ${err.message}`);
+            log.push(`  ✗ Fehler: ${err.message}`);
             totalSkipped++;
           }
         }
 
-        // lastImportedAt aktualisieren
-        const siteIndex = sites.findIndex(s => s.url === site.url);
-        if (siteIndex !== -1) {
-          sites[siteIndex].lastImportedAt = new Date().toISOString();
-        }
+        const idx = sites.findIndex(s => s.url === site.url);
+        if (idx !== -1) sites[idx].lastImportedAt = new Date().toISOString();
 
       } catch (err) {
         log.push(`  ✗ Scan-Fehler: ${err.message}`);
-        totalSkipped++;
       }
     }
 
-    // Aktualisierte Seitenliste speichern
     await redisPost(["set", "import_urls", JSON.stringify(sites)]);
 
-    // Scan-Log speichern
-    const scanLog = {
-      startedAt: new Date().toISOString(),
-      imported: totalImported,
-      skipped: totalSkipped,
-      log
-    };
+    const scanLog = { startedAt: new Date().toISOString(), imported: totalImported, skipped: totalSkipped, log };
     const existingLogs = await redis("get", "cron_logs");
     const logs = existingLogs ? JSON.parse(existingLogs) : [];
     logs.unshift(scanLog);
